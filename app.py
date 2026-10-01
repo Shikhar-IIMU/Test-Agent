@@ -1,14 +1,12 @@
-import os
 import re
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta
 
 import streamlit as st
-from google import genai
-from tavily import TavilyClient
-from tavily.errors import InvalidAPIKeyError
+from ddgs import DDGS
 
 st.set_page_config(
-    page_title="AI Competitive Intelligence",
+    page_title="Zero-Key Competitive Intelligence",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -17,216 +15,308 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {max-width:1250px; padding-top:2rem; padding-bottom:3rem;}
-    .ci-title {font-size:2.3rem; font-weight:750; margin-bottom:.2rem;}
-    .ci-subtitle {color:#667085; margin-bottom:1.5rem;}
+    .block-container {max-width: 1250px; padding-top: 2rem; padding-bottom: 3rem;}
+    .title {font-size: 2.25rem; font-weight: 750; margin-bottom: .25rem;}
+    .subtitle {color: #667085; margin-bottom: 1.5rem;}
+    .card {border:1px solid rgba(128,128,128,.25); border-radius:12px; padding:1rem;}
+    .muted {color:#667085; font-size:.85rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-MODEL = "gemini-3.8-flash"
+SEARCH_REGION = "in-en"
 
 
-def get_secret(name: str) -> str:
-    try:
-        value = st.secrets.get(name, "")
-    except Exception:
-        value = ""
-    return (value or os.getenv(name, "")).strip()
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
+def ddg_search(query: str, max_results: int = 8, timelimit: str | None = None):
+    """Keyless public-web search using DDGS."""
+    return list(
+        DDGS().text(
+            query,
+            region=SEARCH_REGION,
+            safesearch="moderate",
+            timelimit=timelimit,
+            max_results=max_results,
+            backend="auto",
+        )
+    )
 
 
-def build_queries(company: str, industry: str, geography: str) -> list[str]:
-    context = f"{company} {industry}".strip()
-    geo = geography.strip() or "India"
-    return [
-        f"{context} competitors {geo}",
-        f"{company} official products features {geo}",
-        f"{company} official pricing plans {geo}",
-        f"{company} latest news developments {geo}",
-        f"{company} funding partnerships expansion {geo}",
-        f"{company} customer reviews market feedback {geo}",
+def ddg_news(query: str, max_results: int = 8):
+    return list(
+        DDGS().news(
+            query,
+            region=SEARCH_REGION,
+            safesearch="moderate",
+            timelimit="y",
+            max_results=max_results,
+            backend="auto",
+        )
+    )
+
+
+def domain_of(url: str) -> str:
+    match = re.search(r"https?://(?:www\.)?([^/]+)", url or "")
+    return match.group(1) if match else ""
+
+
+def dedupe(results):
+    seen = set()
+    output = []
+    for r in results:
+        url = r.get("href") or r.get("url") or ""
+        title = clean_text(r.get("title", ""))
+        key = url.lower() or title.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(
+            {
+                "title": title,
+                "url": url,
+                "body": clean_text(r.get("body", "")),
+                "date": clean_text(r.get("date", "")),
+                "source": clean_text(r.get("source", "")) or domain_of(url),
+            }
+        )
+    return output
+
+
+def discover_competitors(company: str, industry: str, geography: str, count: int):
+    queries = [
+        f'"{company}" competitors {industry} {geography}'.strip(),
+        f'alternatives to "{company}" {industry} {geography}'.strip(),
+        f'{company} vs competitors {industry} {geography}'.strip(),
+    ]
+    results = dedupe([r for q in queries for r in ddg_search(q, 8)])
+
+    stop = {
+        company.lower(),
+        "company",
+        "competitor",
+        "competitors",
+        "alternative",
+        "alternatives",
+        "india",
+        "indian",
+    }
+
+    name_counts = Counter()
+    evidence = {}
+    for r in results:
+        blob = f"{r['title']} {r['body']}"
+        # Extract likely capitalised company/product names from titles/snippets.
+        candidates = re.findall(
+            r"\b(?:[A-Z][A-Za-z0-9&.'-]{1,}\s+){0,3}[A-Z][A-Za-z0-9&.'-]{1,}\b",
+            r["title"],
+        )
+        for candidate in candidates:
+            candidate = clean_text(candidate).strip(" -|:")
+            low = candidate.lower()
+            if low in stop or company.lower() in low:
+                continue
+            if len(candidate) < 3 or len(candidate) > 45:
+                continue
+            name_counts[candidate] += 1
+            evidence.setdefault(candidate, []).append(r)
+
+    # Common competitor-list phrases are often cleaner than generic named entities.
+    phrase_candidates = []
+    for r in results:
+        text = f"{r['title']} {r['body']}"
+        for pattern in [
+            r"(?:competitors?|alternatives?)\s*(?:include|are|:)\s*([^.;|]+)",
+            r"(?:compared with|vs\.?|versus)\s*([^.;|]+)",
+        ]:
+            m = re.search(pattern, text, flags=re.I)
+            if m:
+                phrase_candidates.extend(
+                    [clean_text(x) for x in re.split(r",| and | \| ", m.group(1))]
+                )
+
+    for c in phrase_candidates:
+        low = c.lower()
+        if 2 < len(c) < 45 and company.lower() not in low and low not in stop:
+            name_counts[c] += 2
+            evidence.setdefault(c, []).extend(results[:2])
+
+    ranked = name_counts.most_common()
+    competitors = []
+    for name, score in ranked:
+        # Filter obvious non-business fragments.
+        if any(x in name.lower() for x in ["best ", "top ", "list of", "guide to", "what is "]):
+            continue
+        competitors.append(
+            {
+                "name": name,
+                "type": "Potential direct/indirect competitor",
+                "signal": score,
+                "evidence": evidence.get(name, [])[:2],
+            }
+        )
+        if len(competitors) >= count:
+            break
+
+    return competitors, results
+
+
+def extract_prices(text: str):
+    patterns = [
+        r"(?:₹|Rs\.?|INR)\s?[0-9][0-9,]*(?:\.[0-9]+)?(?:\s*(?:/\s*)?(?:month|mo|year|yr|day|meal|user|seat))?",
+        r"\$\s?[0-9][0-9,]*(?:\.[0-9]+)?(?:\s*(?:/\s*)?(?:month|mo|year|yr|day|user|seat))?",
+        r"(?:from|starting at|starts at)\s+(?:₹|Rs\.?|INR|\$)?\s?[0-9][0-9,]*(?:\.[0-9]+)?",
+    ]
+    found = []
+    for p in patterns:
+        found.extend(re.findall(p, text, flags=re.I))
+    # Keep short unique values.
+    output = []
+    for x in found:
+        x = clean_text(x)
+        if x.lower() not in [y.lower() for y in output]:
+            output.append(x)
+    return output[:5]
+
+
+def research_company(company: str, industry: str, geography: str, competitor_count: int):
+    queries = [
+        f'"{company}" official website {industry}',
+        f'"{company}" pricing plans {geography}',
+        f'"{company}" products features {geography}',
+        f'"{company}" customer reviews {geography}',
     ]
 
+    core = dedupe([r for q in queries for r in ddg_search(q, 6)])
+    news = dedupe(ddg_news(f"{company} latest news {geography}", 8))
 
-def search_tavily(client: TavilyClient, query: str, max_results: int = 5):
-    return client.search(
-        query=query,
-        search_depth="advanced",
-        max_results=max_results,
-        include_answer=False,
-        include_raw_content=False,
+    competitors, comp_search = discover_competitors(
+        company, industry, geography, competitor_count
     )
 
+    all_evidence = dedupe(core + comp_search)
 
-def tavily_research(company: str, industry: str, geography: str, max_results: int = 5):
-    """
-    Uses a supplied Tavily API key when available.
-    If the key is missing OR rejected, automatically falls back to Tavily's
-    current keyless search mode for a free/demo experience.
-    """
-    authenticated = bool(TAVILY_API_KEY)
-    client = TavilyClient(api_key=TAVILY_API_KEY) if authenticated else TavilyClient()
-
-    all_results = []
-    seen_urls = set()
-    used_keyless = not authenticated
-
-    for query in build_queries(company, industry, geography):
-        try:
-            result = search_tavily(client, query, max_results)
-        except InvalidAPIKeyError:
-            # A bad/expired key should not crash the whole app.
-            # Tavily's current Python SDK supports keyless search mode.
-            client = TavilyClient()
-            used_keyless = True
-            result = search_tavily(client, query, max_results)
-
-        for item in result.get("results", []):
-            url = item.get("url", "")
-            if url and url in seen_urls:
-                continue
-            if url:
-                seen_urls.add(url)
-
-            all_results.append(
-                {
-                    "query": query,
-                    "title": item.get("title", ""),
-                    "url": url,
-                    "content": item.get("content", ""),
-                    "published_date": item.get("published_date", ""),
-                }
-            )
-
-    return all_results, used_keyless
+    return {
+        "core": core,
+        "news": news,
+        "competitors": competitors,
+        "all": all_evidence,
+    }
 
 
-def format_evidence(results: list[dict]) -> str:
-    chunks = []
-    for i, item in enumerate(results, start=1):
-        chunks.append(
-            f"""SOURCE {i}
-Query: {item['query']}
-Title: {item['title']}
-URL: {item['url']}
-Published: {item['published_date'] or 'Not available'}
-Extract:
-{item['content']}
-"""
+def make_feature_signals(company: str, evidence):
+    feature_keywords = [
+        "mobile app", "web app", "subscription", "free plan", "premium",
+        "rewards", "delivery", "analytics", "API", "integration", "financing",
+        "loans", "insurance", "marketplace", "membership", "personalisation",
+        "AI", "artificial intelligence", "customer support", "offline store",
+    ]
+
+    rows = []
+    for feature in feature_keywords:
+        hits = [
+            r for r in evidence
+            if feature.lower() in f"{r['title']} {r['body']}".lower()
+        ]
+        status = "✓" if hits else "?"
+        note = (
+            f"Found in {len(hits)} web result(s); verify against the source."
+            if hits
+            else "Insufficient public evidence in the current search."
         )
-    return "\n\n".join(chunks)
+        rows.append((feature, status, note))
+
+    return rows
 
 
-def build_prompt(company, industry, geography, competitor_count, evidence):
-    report_date = datetime.now(timezone.utc).strftime("%d %b %Y")
-    return f"""
-You are an MBA strategy analyst preparing a current competitive intelligence report.
+def make_markdown_report(company, industry, geography, data):
+    generated = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    price_rows = []
+    for r in data["core"]:
+        prices = extract_prices(f"{r['title']} {r['body']}")
+        for p in prices:
+            price_rows.append((p, r["title"], r["url"]))
 
-TARGET COMPANY: {company}
-INDUSTRY: {industry or "Infer from the evidence"}
-GEOGRAPHY: {geography or "India"}
-REPORT DATE: {report_date}
+    lines = [
+        "# Executive Summary",
+        f"- Target: **{company}** | Geography: **{geography or 'India'}** | Generated: {generated}",
+        f"- Potential competitors surfaced from current web search: **{len(data['competitors'])}**.",
+        "- Pricing observations below are extracted from public search results and should be verified on the linked source page.",
+        "- Feature marks use `✓` only when a search result explicitly mentions the feature; `?` means insufficient evidence.",
+        "- Recent developments are based on news-search results from the last year.",
+        "",
+        "# Company Snapshot",
+        "| Item | Finding |",
+        "|---|---|",
+        f"| Company | {company} |",
+        f"| Industry | {industry or 'Inferred from search context'} |",
+        f"| Geography | {geography or 'India'} |",
+        f"| Web sources reviewed | {len(data['all'])} |",
+        "",
+        "# Competitive Landscape",
+        "| Competitor surfaced | Signal | Evidence |",
+        "|---|---:|---|",
+    ]
 
-Use ONLY the supplied evidence. Do not add current facts from model memory.
+    for c in data["competitors"]:
+        evidence_url = c["evidence"][0]["url"] if c["evidence"] else ""
+        lines.append(f"| {c['name']} | {c['signal']} | {evidence_url} |")
 
-Identify {competitor_count} relevant competitors and classify them as Direct, Indirect or Emerging.
+    lines += [
+        "",
+        "# Feature Signals",
+        "| Feature | Target company | Evidence note |",
+        "|---|:---:|---|",
+    ]
+    for feature, status, note in make_feature_signals(company, data["all"]):
+        lines.append(f"| {feature} | {status} | {note} |")
 
-EVIDENCE RULES
-- Never invent prices, features, dates, funding, partnerships, customers, market share or news.
-- "Not found" is NOT the same as "does not exist".
-- Feature comparison cells:
-  ✓ = explicitly supported
-  ✕ = explicitly stated unavailable/not offered
-  ? = insufficient evidence
-- Pricing must include currency, billing basis, geography and last checked date when available.
-- Separate FACT, INTERPRETATION and HYPOTHESIS.
-- When evidence conflicts, state the conflict.
-- Include source URLs for material claims.
-- Do not produce an overall winner or rank companies.
+    lines += [
+        "",
+        "# Pricing Signals",
+        "| Observed price | Search result | Source |",
+        "|---|---|---|",
+    ]
+    for price, title, url in price_rows[:15]:
+        lines.append(f"| {price} | {title} | {url} |")
+    if not price_rows:
+        lines.append("| Insufficient public evidence | | |")
 
-OUTPUT:
+    lines += [
+        "",
+        "# Recent Developments",
+        "| Date | Headline | Source |",
+        "|---|---|---|",
+    ]
+    for r in data["news"][:8]:
+        lines.append(f"| {r['date'] or 'Date not shown'} | {r['title']} | {r['url']} |")
 
-# Executive Summary
-5-7 concise bullets.
+    lines += [
+        "",
+        "# Strategic Implications",
+        "- Which competitor appears repeatedly across current search results?",
+        "- Which features have clear public evidence and which still require verification?",
+        "- Which pricing claims are sourced directly enough to support a pricing benchmark?",
+        "- Which recent developments could materially change the competitive landscape?",
+        "",
+        "# Data Gaps",
+        "- Public search results may not reveal negotiated enterprise pricing, internal product roadmaps, or complete feature matrices.",
+        "- Search-engine snippets can be incomplete or outdated; verify high-stakes claims on the source page.",
+        "",
+        "# Sources",
+    ]
+    for i, r in enumerate(data["all"][:25], start=1):
+        lines.append(f"{i}. {r['title']} — {r['url']}")
 
-# Company Snapshot
-Table: Item | Finding
-
-# Competitive Landscape
-Table: Competitor | Type | Why it competes | Key evidence
-
-# Feature Comparison
-8-12 decision-relevant features. Columns:
-Feature | Target company | Competitor 1 | Competitor 2 ... | Evidence note
-
-# Pricing Comparison
-Table:
-Company | Plan | Price | Billing basis | Geography | Major inclusions | Last checked | Source
-
-# Recent Developments
-Up to 8 recent developments, prioritising the last 12 months.
-Table:
-Date | Company | Development | Category | Business relevance | Source
-
-# Customer / Market Signals
-Clearly label FACT and INTERPRETATION.
-
-# Strategic Implications
-5-7 evidence-backed observations or questions for management to investigate.
-
-# Data Gaps
-List important facts that could not be verified.
-
-# Sources
-Numbered list of important source titles and direct URLs.
-
-Keep the report concise, professional, human and suitable for an MBA/management audience.
-
-SUPPLIED WEB EVIDENCE:
-{evidence}
-"""
-
-
-def analyse(company, industry, geography, competitor_count):
-    results, used_keyless = tavily_research(company, industry, geography)
-    if not results:
-        raise RuntimeError(
-            "No web results were returned. Try a broader company name or add a valid Tavily API key."
-        )
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=build_prompt(
-            company,
-            industry,
-            geography,
-            competitor_count,
-            format_evidence(results),
-        ),
-    )
-    return response.text or "No report was returned.", len(results), used_keyless
+    return "\n".join(lines)
 
 
-def split_sections(report: str):
-    matches = list(re.finditer(r"(?m)^# (.+)$", report))
-    sections = []
-    for i, match in enumerate(matches):
-        title = match.group(1).strip()
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(report)
-        sections.append((title, report[start:end].strip()))
-    return sections
-
-
-st.markdown('<div class="ci-title">📊 AI Competitive Intelligence</div>', unsafe_allow_html=True)
+st.markdown('<div class="title">📊 Zero-Key Competitive Intelligence</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="ci-subtitle">Competitor discovery, feature benchmarking, pricing intelligence and recent developments.</div>',
+    '<div class="subtitle">No Gemini key. No OpenAI key. No Tavily key. Uses public web search and deterministic analysis.</div>',
     unsafe_allow_html=True,
 )
 
@@ -236,131 +326,145 @@ with st.sidebar:
     industry = st.text_input("Industry (optional)", placeholder="e.g., Specialty coffee")
     geography = st.text_input("Geography", value="India")
     competitor_count = st.slider("Competitors", 3, 7, 5)
-
-    st.divider()
     run = st.button("🚀 Run intelligence", type="primary", use_container_width=True)
-
-    if TAVILY_API_KEY:
-        st.caption("Tavily key detected. The app will use it and fall back to keyless search if it is rejected.")
-    else:
-        st.caption("No Tavily key detected. The app will use Tavily's rate-limited keyless search mode.")
-
-if not GEMINI_API_KEY:
-    st.warning("Add your Gemini API key in Streamlit Secrets.")
-    st.code('GEMINI_API_KEY = "your-gemini-key"', language="toml")
 
 if run:
     if not company.strip():
         st.error("Enter a company or product.")
-    elif not GEMINI_API_KEY:
-        st.error("GEMINI_API_KEY is missing.")
     else:
-        with st.status("Researching the competitive landscape...", expanded=True) as status:
-            st.write("Searching competitors, features, pricing, news and market signals...")
+        with st.status("Searching the public web...", expanded=True) as status:
             try:
-                report, source_count, used_keyless = analyse(
+                data = research_company(
                     company.strip(),
                     industry.strip(),
                     geography.strip(),
                     competitor_count,
                 )
-
-                st.session_state["report"] = report
-                st.session_state["meta"] = {
-                    "company": company.strip(),
-                    "source_count": source_count,
-                    "generated_at": datetime.now().strftime("%d %b %Y, %I:%M %p"),
-                    "used_keyless": used_keyless,
-                }
-
-                status.update(
-                    label="Research completed",
-                    state="complete",
-                    expanded=False,
-                )
+                st.session_state["data"] = data
+                st.session_state["company"] = company.strip()
+                st.session_state["industry"] = industry.strip()
+                st.session_state["geography"] = geography.strip()
+                st.session_state["generated"] = datetime.now().strftime("%d %b %Y, %I:%M %p")
+                status.update(label="Research completed", state="complete", expanded=False)
             except Exception as exc:
-                status.update(
-                    label="Research failed",
-                    state="error",
-                    expanded=True,
-                )
+                status.update(label="Search failed", state="error", expanded=True)
                 st.exception(exc)
 
-report = st.session_state.get("report")
+data = st.session_state.get("data")
+if data:
+    company = st.session_state["company"]
+    industry = st.session_state["industry"]
+    geography = st.session_state["geography"]
 
-if report:
-    meta = st.session_state.get("meta", {})
-    if meta.get("used_keyless"):
-        st.info(
-            "Tavily API key was not used. The app successfully used Tavily's "
-            "rate-limited keyless search mode. Adding a valid Tavily key gives you higher limits."
-        )
-    else:
-        st.success(
-            f"Report ready for {meta.get('company', 'company')} · "
-            f"{meta.get('source_count', 0)} unique web sources reviewed."
-        )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Potential competitors", len(data["competitors"]))
+    m2.metric("Web sources", len(data["all"]))
+    m3.metric("News results", len(data["news"]))
+    m4.metric("Pricing signals", sum(len(extract_prices(f"{r['title']} {r['body']}")) for r in data["core"]))
 
-    lookup = {title.lower(): body for title, body in split_sections(report)}
-
-    labels = [
+    tabs = st.tabs([
         "Executive Summary",
-        "Company Snapshot",
-        "Competitive Landscape",
-        "Feature Comparison",
-        "Pricing Comparison",
-        "Recent Developments",
-        "Customer / Market Signals",
-        "Strategic Implications",
-        "Data Gaps",
+        "Competitors",
+        "Features",
+        "Pricing",
+        "News",
         "Sources",
-    ]
+    ])
 
-    tabs = st.tabs(labels)
-    for tab, label in zip(tabs, labels):
-        with tab:
-            body = lookup.get(label.lower())
-            st.markdown(body or "This section was not returned.")
-
-    st.divider()
-    base = re.sub(r"[^A-Za-z0-9_-]+", "_", meta.get("company", "company")).strip("_")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "⬇️ Download Markdown",
-            report,
-            file_name=f"{base}_competitive_intelligence.md",
-            mime="text/markdown",
-            use_container_width=True,
+    with tabs[0]:
+        st.markdown("### Executive Summary")
+        st.write(
+            f"This report uses current public search results for **{company}** in **{geography or 'India'}**."
         )
-    with c2:
-        st.download_button(
-            "⬇️ Download TXT",
-            report,
-            file_name=f"{base}_competitive_intelligence.txt",
-            mime="text/plain",
+        st.write(
+            "The system is evidence-first: search signals are shown with source links, and missing evidence is marked as `?` rather than treated as proof of absence."
+        )
+        st.markdown("### Key observations to investigate")
+        for item in [
+            f"{len(data['competitors'])} potential competitor names were surfaced.",
+            f"{len(data['news'])} recent news results were collected.",
+            "Pricing observations are extracted from public search snippets and should be verified on the source page.",
+            "Feature signals indicate where public evidence exists, not a complete product audit.",
+        ]:
+            st.markdown(f"- {item}")
+
+    with tabs[1]:
+        st.markdown("### Competitive Landscape")
+        if data["competitors"]:
+            st.dataframe(
+                [
+                    {
+                        "Competitor surfaced": c["name"],
+                        "Search signal": c["signal"],
+                        "Evidence": c["evidence"][0]["url"] if c["evidence"] else "",
+                    }
+                    for c in data["competitors"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No competitor names could be surfaced reliably. Try a more specific company name.")
+
+    with tabs[2]:
+        st.markdown("### Feature Signals")
+        st.dataframe(
+            [
+                {"Feature": f, "Evidence": s, "Note": n}
+                for f, s, n in make_feature_signals(company, data["all"])
+            ],
             use_container_width=True,
+            hide_index=True,
         )
 
-    st.caption(
-        f"Generated {meta.get('generated_at', '')}. Current information can change; "
-        "verify important decisions against linked sources."
+    with tabs[3]:
+        rows = []
+        for r in data["core"]:
+            for price in extract_prices(f"{r['title']} {r['body']}"):
+                rows.append({"Observed price": price, "Result": r["title"], "Source": r["url"]})
+        st.markdown("### Public Pricing Signals")
+        if rows:
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No public price signal was detected in the current search.")
+
+    with tabs[4]:
+        st.markdown("### Recent Developments")
+        st.dataframe(
+            [
+                {
+                    "Date": r["date"] or "Date not shown",
+                    "Headline": r["title"],
+                    "Source": r["url"],
+                }
+                for r in data["news"][:10]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with tabs[5]:
+        st.markdown("### Sources used")
+        for i, r in enumerate(data["all"][:30], start=1):
+            st.markdown(f"**{i}. {r['title']}**  \n{r['url']}")
+
+    report = make_markdown_report(company, industry, geography, data)
+    st.download_button(
+        "⬇️ Download full Markdown report",
+        report,
+        file_name=re.sub(r"[^A-Za-z0-9_-]+", "_", company).strip("_") + "_competitive_intelligence.md",
+        mime="text/markdown",
+        use_container_width=True,
     )
+
 else:
     st.info(
-        "Enter a company in the sidebar. Example: Blue Tokai → Specialty coffee → India."
+        "Enter a company and click **Run intelligence**. Example: Blue Tokai → Specialty coffee → India."
     )
 
-with st.expander("How the agent works"):
-    st.markdown(
-        """
-        **Tavily** searches current public web sources. If a supplied Tavily key is
-        rejected, the app automatically retries using Tavily's keyless search mode.
-
-        **Gemini** synthesises the retrieved evidence into a structured competitive
-        intelligence report.
-
-        **Streamlit** provides the dashboard and downloads.
-        """
+with st.expander("What makes this zero-key?"):
+    st.write(
+        "The app does not call Gemini, OpenAI, Tavily, or another paid API. "
+        "It uses the keyless DDGS public web-search library and performs the feature, pricing, "
+        "competitor-signal and report generation locally in Python."
     )
