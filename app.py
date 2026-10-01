@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import streamlit as st
 from google import genai
 from tavily import TavilyClient
+from tavily.errors import InvalidAPIKeyError
 
 st.set_page_config(
     page_title="AI Competitive Intelligence",
@@ -16,11 +17,9 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {max-width: 1250px; padding-top: 2rem; padding-bottom: 3rem;}
-    .ci-title {font-size: 2.3rem; font-weight: 750; margin-bottom: .2rem;}
+    .block-container {max-width:1250px; padding-top:2rem; padding-bottom:3rem;}
+    .ci-title {font-size:2.3rem; font-weight:750; margin-bottom:.2rem;}
     .ci-subtitle {color:#667085; margin-bottom:1.5rem;}
-    .ci-card {border:1px solid rgba(128,128,128,.25); border-radius:12px; padding:1rem;}
-    .muted {color:#667085; font-size:.86rem;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -29,16 +28,16 @@ st.markdown(
 MODEL = "gemini-2.5-flash"
 
 
-def secret_or_env(name: str) -> str:
+def get_secret(name: str) -> str:
     try:
         value = st.secrets.get(name, "")
     except Exception:
         value = ""
-    return value or os.getenv(name, "")
+    return (value or os.getenv(name, "")).strip()
 
 
-GEMINI_API_KEY = secret_or_env("GEMINI_API_KEY")
-TAVILY_API_KEY = secret_or_env("TAVILY_API_KEY")
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
 
 
 def build_queries(company: str, industry: str, geography: str) -> list[str]:
@@ -54,25 +53,46 @@ def build_queries(company: str, industry: str, geography: str) -> list[str]:
     ]
 
 
-def tavily_research(company: str, industry: str, geography: str, max_results: int = 6):
-    client = TavilyClient(api_key=TAVILY_API_KEY)
+def search_tavily(client: TavilyClient, query: str, max_results: int = 5):
+    return client.search(
+        query=query,
+        search_depth="advanced",
+        max_results=max_results,
+        include_answer=False,
+        include_raw_content=False,
+    )
+
+
+def tavily_research(company: str, industry: str, geography: str, max_results: int = 5):
+    """
+    Uses a supplied Tavily API key when available.
+    If the key is missing OR rejected, automatically falls back to Tavily's
+    current keyless search mode for a free/demo experience.
+    """
+    authenticated = bool(TAVILY_API_KEY)
+    client = TavilyClient(api_key=TAVILY_API_KEY) if authenticated else TavilyClient()
+
     all_results = []
     seen_urls = set()
+    used_keyless = not authenticated
 
     for query in build_queries(company, industry, geography):
-        result = client.search(
-            query=query,
-            search_depth="advanced",
-            max_results=max_results,
-            include_answer=False,
-            include_raw_content=False,
-        )
+        try:
+            result = search_tavily(client, query, max_results)
+        except InvalidAPIKeyError:
+            # A bad/expired key should not crash the whole app.
+            # Tavily's current Python SDK supports keyless search mode.
+            client = TavilyClient()
+            used_keyless = True
+            result = search_tavily(client, query, max_results)
+
         for item in result.get("results", []):
             url = item.get("url", "")
             if url and url in seen_urls:
                 continue
             if url:
                 seen_urls.add(url)
+
             all_results.append(
                 {
                     "query": query,
@@ -82,7 +102,8 @@ def tavily_research(company: str, industry: str, geography: str, max_results: in
                     "published_date": item.get("published_date", ""),
                 }
             )
-    return all_results
+
+    return all_results, used_keyless
 
 
 def format_evidence(results: list[dict]) -> str:
@@ -101,105 +122,95 @@ Extract:
     return "\n\n".join(chunks)
 
 
-def build_analysis_prompt(
-    company: str,
-    industry: str,
-    geography: str,
-    competitor_count: int,
-    evidence: str,
-) -> str:
-    today = datetime.now(timezone.utc).strftime("%d %b %Y")
-    industry_text = industry.strip() or "Infer from evidence."
-    geography_text = geography.strip() or "India"
-
+def build_prompt(company, industry, geography, competitor_count, evidence):
+    report_date = datetime.now(timezone.utc).strftime("%d %b %Y")
     return f"""
-You are an MBA strategy analyst preparing a competitive intelligence report.
+You are an MBA strategy analyst preparing a current competitive intelligence report.
 
 TARGET COMPANY: {company}
-INDUSTRY: {industry_text}
-GEOGRAPHY: {geography_text}
-REPORT DATE: {today}
+INDUSTRY: {industry or "Infer from the evidence"}
+GEOGRAPHY: {geography or "India"}
+REPORT DATE: {report_date}
 
-Use ONLY the evidence supplied below. Do not use model memory to add current facts.
+Use ONLY the supplied evidence. Do not add current facts from model memory.
 
-Your tasks:
-1. Identify {competitor_count} relevant competitors.
-2. Classify each as Direct, Indirect, or Emerging.
-3. Compare decision-relevant features.
-4. Compare publicly available pricing where evidence exists.
-5. Summarise recent developments, prioritising the last 12 months.
-6. Summarise customer/market signals only where evidence exists.
-7. Produce evidence-backed strategic implications.
+Identify {competitor_count} relevant competitors and classify them as Direct, Indirect or Emerging.
 
 EVIDENCE RULES
-- Never invent a price, feature, funding amount, date, partnership, customer, market share, or news item.
+- Never invent prices, features, dates, funding, partnerships, customers, market share or news.
 - "Not found" is NOT the same as "does not exist".
-- For feature cells use ✓, ✕, or ?:
-  ✓ = explicitly supported by supplied evidence
-  ✕ = explicitly stated as unavailable/not offered
+- Feature comparison cells:
+  ✓ = explicitly supported
+  ✕ = explicitly stated unavailable/not offered
   ? = insufficient evidence
-- For pricing, show currency, billing basis, geography, and last-checked date where available.
-- Separate FACT from INTERPRETATION from HYPOTHESIS.
-- Where evidence conflicts, state the conflict.
-- Every material claim should include a source link using the URL supplied.
-- Do not present a single overall winner or rank companies.
-- Keep writing concise, professional, and suitable for an MBA/management audience.
+- Pricing must include currency, billing basis, geography and last checked date when available.
+- Separate FACT, INTERPRETATION and HYPOTHESIS.
+- When evidence conflicts, state the conflict.
+- Include source URLs for material claims.
+- Do not produce an overall winner or rank companies.
 
-OUTPUT EXACTLY THESE SECTIONS:
+OUTPUT:
 
 # Executive Summary
-5-7 bullets.
+5-7 concise bullets.
 
 # Company Snapshot
-Markdown table with: Item | Finding
+Table: Item | Finding
 
 # Competitive Landscape
-Markdown table with: Competitor | Type | Why it competes | Key evidence
+Table: Competitor | Type | Why it competes | Key evidence
 
 # Feature Comparison
-Create an 8-12 row comparison table. Columns:
-Feature | {company} | Competitor 1 | Competitor 2 ... | Evidence note
-Use ✓ / ✕ / ? only in company cells.
+8-12 decision-relevant features. Columns:
+Feature | Target company | Competitor 1 | Competitor 2 ... | Evidence note
 
 # Pricing Comparison
-Markdown table:
+Table:
 Company | Plan | Price | Billing basis | Geography | Major inclusions | Last checked | Source
 
 # Recent Developments
-Up to 8 items. Table:
+Up to 8 recent developments, prioritising the last 12 months.
+Table:
 Date | Company | Development | Category | Business relevance | Source
 
 # Customer / Market Signals
-Use FACT / INTERPRETATION labels.
+Clearly label FACT and INTERPRETATION.
 
 # Strategic Implications
-5-7 evidence-backed observations or questions for management to investigate. Do not invent unsupported recommendations.
+5-7 evidence-backed observations or questions for management to investigate.
 
 # Data Gaps
-Important facts that could not be verified.
+List important facts that could not be verified.
 
 # Sources
-Numbered list of the most important source titles with their direct URLs.
+Numbered list of important source titles and direct URLs.
+
+Keep the report concise, professional, human and suitable for an MBA/management audience.
 
 SUPPLIED WEB EVIDENCE:
 {evidence}
 """
 
 
-def analyse(company: str, industry: str, geography: str, competitor_count: int) -> tuple[str, int]:
-    results = tavily_research(company, industry, geography)
-    evidence = format_evidence(results)
+def analyse(company, industry, geography, competitor_count):
+    results, used_keyless = tavily_research(company, industry, geography)
+    if not results:
+        raise RuntimeError(
+            "No web results were returned. Try a broader company name or add a valid Tavily API key."
+        )
 
     client = genai.Client(api_key=GEMINI_API_KEY)
-    prompt = build_analysis_prompt(
-        company, industry, geography, competitor_count, evidence
-    )
-
     response = client.models.generate_content(
         model=MODEL,
-        contents=prompt,
+        contents=build_prompt(
+            company,
+            industry,
+            geography,
+            competitor_count,
+            format_evidence(results),
+        ),
     )
-    return response.text or "No report was returned.", len(results)
+    return response.text or "No report was returned.", len(results), used_keyless
 
 
 def split_sections(report: str):
@@ -215,7 +226,7 @@ def split_sections(report: str):
 
 st.markdown('<div class="ci-title">📊 AI Competitive Intelligence</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="ci-subtitle">Research competitors, benchmark features and pricing, and surface recent market intelligence.</div>',
+    '<div class="ci-subtitle">Competitor discovery, feature benchmarking, pricing intelligence and recent developments.</div>',
     unsafe_allow_html=True,
 )
 
@@ -228,60 +239,69 @@ with st.sidebar:
 
     st.divider()
     run = st.button("🚀 Run intelligence", type="primary", use_container_width=True)
-    clear = st.button("Clear report", use_container_width=True)
 
-if clear:
-    st.session_state.pop("report", None)
-    st.session_state.pop("meta", None)
-    st.rerun()
+    if TAVILY_API_KEY:
+        st.caption("Tavily key detected. The app will use it and fall back to keyless search if it is rejected.")
+    else:
+        st.caption("No Tavily key detected. The app will use Tavily's rate-limited keyless search mode.")
 
-if not GEMINI_API_KEY or not TAVILY_API_KEY:
-    st.warning("Add both API keys to Streamlit Secrets before running the agent.")
-    st.code(
-        'GEMINI_API_KEY = "your-gemini-key"\n'
-        'TAVILY_API_KEY = "your-tavily-key"',
-        language="toml",
-    )
+if not GEMINI_API_KEY:
+    st.warning("Add your Gemini API key in Streamlit Secrets.")
+    st.code('GEMINI_API_KEY = "your-gemini-key"', language="toml")
 
 if run:
     if not company.strip():
         st.error("Enter a company or product.")
     elif not GEMINI_API_KEY:
         st.error("GEMINI_API_KEY is missing.")
-    elif not TAVILY_API_KEY:
-        st.error("TAVILY_API_KEY is missing.")
     else:
         with st.status("Researching the competitive landscape...", expanded=True) as status:
-            st.write("Searching competitor, product, pricing, news and customer-signal sources...")
+            st.write("Searching competitors, features, pricing, news and market signals...")
             try:
-                report, source_count = analyse(
+                report, source_count, used_keyless = analyse(
                     company.strip(),
                     industry.strip(),
                     geography.strip(),
                     competitor_count,
                 )
+
                 st.session_state["report"] = report
                 st.session_state["meta"] = {
                     "company": company.strip(),
                     "source_count": source_count,
                     "generated_at": datetime.now().strftime("%d %b %Y, %I:%M %p"),
+                    "used_keyless": used_keyless,
                 }
-                status.update(label="Research completed", state="complete", expanded=False)
+
+                status.update(
+                    label="Research completed",
+                    state="complete",
+                    expanded=False,
+                )
             except Exception as exc:
-                status.update(label="Research failed", state="error", expanded=True)
+                status.update(
+                    label="Research failed",
+                    state="error",
+                    expanded=True,
+                )
                 st.exception(exc)
 
 report = st.session_state.get("report")
 
 if report:
     meta = st.session_state.get("meta", {})
-    st.success(
-        f"Report ready for {meta.get('company', 'company')} · "
-        f"{meta.get('source_count', 0)} unique web sources reviewed."
-    )
+    if meta.get("used_keyless"):
+        st.info(
+            "Tavily API key was not used. The app successfully used Tavily's "
+            "rate-limited keyless search mode. Adding a valid Tavily key gives you higher limits."
+        )
+    else:
+        st.success(
+            f"Report ready for {meta.get('company', 'company')} · "
+            f"{meta.get('source_count', 0)} unique web sources reviewed."
+        )
 
-    sections = split_sections(report)
-    lookup = {title.lower(): body for title, body in sections}
+    lookup = {title.lower(): body for title, body in split_sections(report)}
 
     labels = [
         "Executive Summary",
@@ -300,52 +320,47 @@ if report:
     for tab, label in zip(tabs, labels):
         with tab:
             body = lookup.get(label.lower())
-            if body:
-                st.markdown(body)
-            else:
-                st.info("This section was not returned.")
+            st.markdown(body or "This section was not returned.")
 
     st.divider()
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", meta.get("company", "company")).strip("_")
+
     c1, c2 = st.columns(2)
-    filename_base = re.sub(r"[^A-Za-z0-9_-]+", "_", meta.get("company", "company")).strip("_")
     with c1:
         st.download_button(
             "⬇️ Download Markdown",
-            data=report,
-            file_name=f"{filename_base}_competitive_intelligence.md",
+            report,
+            file_name=f"{base}_competitive_intelligence.md",
             mime="text/markdown",
             use_container_width=True,
         )
     with c2:
         st.download_button(
             "⬇️ Download TXT",
-            data=report,
-            file_name=f"{filename_base}_competitive_intelligence.txt",
+            report,
+            file_name=f"{base}_competitive_intelligence.txt",
             mime="text/plain",
             use_container_width=True,
         )
 
     st.caption(
-        f"Generated {meta.get('generated_at', '')}. "
-        "Current information can change; verify important decisions against the linked sources."
+        f"Generated {meta.get('generated_at', '')}. Current information can change; "
+        "verify important decisions against linked sources."
     )
 else:
     st.info(
-        "Enter a company in the sidebar. Example: **Blue Tokai** → Industry: **Specialty coffee** → Geography: **India**."
+        "Enter a company in the sidebar. Example: Blue Tokai → Specialty coffee → India."
     )
 
 with st.expander("How the agent works"):
     st.markdown(
         """
-        **1. Tavily** runs focused web searches for competitors, products/features, pricing, news,
-        partnerships and customer/market signals.
+        **Tavily** searches current public web sources. If a supplied Tavily key is
+        rejected, the app automatically retries using Tavily's keyless search mode.
 
-        **2. Gemini** receives the collected evidence and turns it into a structured competitive
+        **Gemini** synthesises the retrieved evidence into a structured competitive
         intelligence report.
 
-        **3. Streamlit** presents the report in tabs and lets you download it.
-
-        The app does not store API keys in code and asks the model to mark unsupported information as
-        unavailable instead of guessing.
+        **Streamlit** provides the dashboard and downloads.
         """
     )
