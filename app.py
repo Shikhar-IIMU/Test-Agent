@@ -1,114 +1,96 @@
-    geography = st.session_state["geography"]
+import re
+from collections import Counter
+from datetime import datetime, timedelta
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Potential competitors", len(data["competitors"]))
-    m2.metric("Web sources", len(data["all"]))
-    m3.metric("News results", len(data["news"]))
-    m4.metric("Pricing signals", sum(len(extract_prices(f"{r['title']} {r['body']}")) for r in data["core"]))
+import streamlit as st
+from ddgs import DDGS
+from ddgs.exceptions import DDGSException, TimeoutException, RatelimitException
 
-    tabs = st.tabs([
-        "Executive Summary",
-        "Competitors",
-        "Features",
-        "Pricing",
-        "News",
-        "Sources",
-    ])
+st.set_page_config(
+    page_title="Zero-Key Competitive Intelligence",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-    with tabs[0]:
-        st.markdown("### Executive Summary")
-        st.write(
-            f"This report uses current public search results for **{company}** in **{geography or 'India'}**."
-        )
-        st.write(
-            "The system is evidence-first: search signals are shown with source links, and missing evidence is marked as `?` rather than treated as proof of absence."
-        )
-        st.markdown("### Key observations to investigate")
-        for item in [
-            f"{len(data['competitors'])} potential competitor names were surfaced.",
-            f"{len(data['news'])} recent news results were collected.",
-            "Pricing observations are extracted from public search snippets and should be verified on the source page.",
-            "Feature signals indicate where public evidence exists, not a complete product audit.",
-        ]:
-            st.markdown(f"- {item}")
+st.markdown(
+    """
+    <style>
+    .block-container {max-width: 1250px; padding-top: 2rem; padding-bottom: 3rem;}
+    .title {font-size: 2.25rem; font-weight: 750; margin-bottom: .25rem;}
+    .subtitle {color: #667085; margin-bottom: 1.5rem;}
+    .card {border:1px solid rgba(128,128,128,.25); border-radius:12px; padding:1rem;}
+    .muted {color:#667085; font-size:.85rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-    with tabs[1]:
-        st.markdown("### Competitive Landscape")
-        if data["competitors"]:
-            st.dataframe(
-                [
-                    {
-                        "Competitor surfaced": c["name"],
-                        "Search signal": c["signal"],
-                        "Evidence": c["evidence"][0]["url"] if c["evidence"] else "",
-                    }
-                    for c in data["competitors"]
-                ],
-                use_container_width=True,
-                hide_index=True,
+SEARCH_REGION = "in-en"
+
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "")).strip()
+
+
+def ddg_search(query: str, max_results: int = 8, timelimit: str | None = None):
+    """Keyless public-web search with fallback backends and timeout handling."""
+    for backend in ["google,bing,brave", "bing,yahoo", "google", "wikipedia"]:
+        try:
+            return list(
+                DDGS(timeout=12).text(
+                    query,
+                    region=SEARCH_REGION,
+                    safesearch="moderate",
+                    timelimit=timelimit,
+                    max_results=max_results,
+                    backend=backend,
+                )
             )
-        else:
-            st.info("No competitor names could be surfaced reliably. Try a more specific company name.")
+        except (TimeoutException, RatelimitException, DDGSException):
+            continue
+        except Exception:
+            continue
+    return []
 
-    with tabs[2]:
-        st.markdown("### Feature Signals")
-        st.dataframe(
-            [
-                {"Feature": f, "Evidence": s, "Note": n}
-                for f, s, n in make_feature_signals(company, data["all"])
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
 
-    with tabs[3]:
-        rows = []
-        for r in data["core"]:
-            for price in extract_prices(f"{r['title']} {r['body']}"):
-                rows.append({"Observed price": price, "Result": r["title"], "Source": r["url"]})
-        st.markdown("### Public Pricing Signals")
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-        else:
-            st.info("No public price signal was detected in the current search.")
+def ddg_news(query: str, max_results: int = 8):
+    """Keyless news search with fallback backends and timeout handling."""
+    for backend in ["bing,yahoo", "bing", "yahoo"]:
+        try:
+            return list(
+                DDGS(timeout=12).news(
+                    query,
+                    region=SEARCH_REGION,
+                    safesearch="moderate",
+                    timelimit="y",
+                    max_results=max_results,
+                    backend=backend,
+                )
+            )
+        except (TimeoutException, RatelimitException, DDGSException):
+            continue
+        except Exception:
+            continue
+    return []
 
-    with tabs[4]:
-        st.markdown("### Recent Developments")
-        st.dataframe(
-            [
-                {
-                    "Date": r["date"] or "Date not shown",
-                    "Headline": r["title"],
-                    "Source": r["url"],
-                }
-                for r in data["news"][:10]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+def domain_of(url: str) -> str:
+    match = re.search(r"https?://(?:www\.)?([^/]+)", url or "")
+    return match.group(1) if match else ""
 
-    with tabs[5]:
-        st.markdown("### Sources used")
-        for i, r in enumerate(data["all"][:30], start=1):
-            st.markdown(f"**{i}. {r['title']}**  \n{r['url']}")
 
-    report = make_markdown_report(company, industry, geography, data)
-    st.download_button(
-        "⬇️ Download full Markdown report",
-        report,
-        file_name=re.sub(r"[^A-Za-z0-9_-]+", "_", company).strip("_") + "_competitive_intelligence.md",
-        mime="text/markdown",
-        use_container_width=True,
-    )
-
-else:
-    st.info(
-        "Enter a company and click **Run intelligence**. Example: Blue Tokai → Specialty coffee → India."
-    )
-
-with st.expander("What makes this zero-key?"):
-    st.write(
-        "The app does not call Gemini, OpenAI, Tavily, or another paid API. "
-        "It uses the keyless DDGS public web-search library and performs the feature, pricing, "
-        "competitor-signal and report generation locally in Python."
-    )
+def dedupe(results):
+    seen = set()
+    output = []
+    for r in results:
+        url = r.get("href") or r.get("url") or ""
+        title = clean_text(r.get("title", ""))
+        key = url.lower() or title.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(
+            {
+                "title": title,
+                "url": url,
+                "body": clean_text(r.get("body", "")),
